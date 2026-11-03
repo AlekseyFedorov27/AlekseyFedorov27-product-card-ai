@@ -19,16 +19,37 @@ class ProductInput(BaseModel):
     def desc_trim(cls, v: str) -> str:
         return (v or "").strip()
 
-    @field_validator("specs")
+    @field_validator("specs", mode="before")
     @classmethod
-    def specs_clean(cls, v: dict[str, str]) -> dict[str, str]:
+    def specs_clean(cls, v):
+        """Приведение specs к dict[str, str].
+
+        Числа/float приводятся к строке, bool → «да»/«нет», None → ''.
+        Значения-контейнеры (dict/list/tuple) отклоняются — это почти всегда
+        ошибка ввода, а не данные прибора.
+        """
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            raise ValueError("specs должен быть объектом {параметр: значение}")
         cleaned: dict[str, str] = {}
         for k, val in v.items():
             if not isinstance(k, str) or not k.strip():
                 raise ValueError("названия характеристик должны быть непустыми строками")
-            if not isinstance(val, str):
-                raise ValueError(f"значение «{k}» должно быть строкой")
-            cleaned[k.strip()] = val.strip()
+            if isinstance(val, bool):
+                val = "да" if val else "нет"
+            elif isinstance(val, (int, float)):
+                val = str(val)
+            elif val is None:
+                val = ""
+            elif isinstance(val, str):
+                val = val.strip()
+            else:
+                raise ValueError(
+                    f"значение «{k.strip()}» должно быть строкой или числом "
+                    f"(получено {type(val).__name__})"
+                )
+            cleaned[k.strip()] = val
         return cleaned
 
 

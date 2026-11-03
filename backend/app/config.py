@@ -7,12 +7,12 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # Отключаем защиту префикса "model_", чтобы поле model_name
+        # не конфликтовало с BaseModel.model_*.
+        protected_namespaces=(),
     )
 
     # ─── LLM ─────────────────────────────────────────────────────
-    # api_key опционален: без него работают run_tests.py --only=A
-    # и diag_llm.py, а первый вызов LLM даст внятную ошибку из
-    # _get_openai_client().
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     model_name: str = "gpt-4o-mini"
@@ -24,7 +24,6 @@ class Settings(BaseSettings):
 
     use_json_mode: bool = False
     use_critic: bool = True
-
 
     checkpoint_db: str = ":memory:"
     cors_origins: str = (

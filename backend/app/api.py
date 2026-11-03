@@ -5,9 +5,19 @@ import uuid
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
-from openai import APITimeoutError, AuthenticationError, RateLimitError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    RateLimitError,
+)
 
-from app.graph import LLMEmptyResponseError, get_async_graph
+from app.graph import (
+    LLMEmptyResponseError,
+    LLMInvalidJSONError,
+    get_async_graph,
+)
 from app.schemas import ApproveRequest, ProductCard, ProductInput
 
 logger = logging.getLogger(__name__)
@@ -88,6 +98,9 @@ async def stream_draft(input_data: ProductInput):
         except LLMEmptyResponseError as exc:
             logger.warning("LLM empty response, thread_id=%s: %s", thread_id, exc)
             yield _sse({"event": "error", "message": str(exc)})
+        except LLMInvalidJSONError as exc:
+            logger.error("LLM invalid JSON, thread_id=%s: %s", thread_id, exc)
+            yield _sse({"event": "error", "message": str(exc)})
         except AuthenticationError:
             logger.exception("LLM auth error, thread_id=%s", thread_id)
             yield _sse({"event": "error", "message": "Неверный API-ключ LLM."})
@@ -97,6 +110,21 @@ async def stream_draft(input_data: ProductInput):
         except (APITimeoutError, TimeoutError):
             logger.exception("LLM timeout, thread_id=%s", thread_id)
             yield _sse({"event": "error", "message": "LLM не ответила вовремя."})
+        except APIConnectionError:
+            logger.exception("LLM connection error, thread_id=%s", thread_id)
+            yield _sse({
+                "event": "error",
+                "message": (
+                    "Не удалось подключиться к LLM. Проверьте OPENAI_BASE_URL "
+                    "и доступность провайдера."
+                ),
+            })
+        except APIStatusError as exc:
+            logger.exception("LLM HTTP error, thread_id=%s", thread_id)
+            yield _sse({
+                "event": "error",
+                "message": f"LLM вернула HTTP {exc.status_code}: {exc.message}",
+            })
         except Exception:
             logger.exception("stream_draft failed, thread_id=%s", thread_id)
             yield _sse({"event": "error", "message": "Внутренняя ошибка сервера."})
@@ -130,12 +158,21 @@ async def resume_draft(thread_id: str, body: ApproveRequest):
         )
     except LLMEmptyResponseError as exc:
         raise HTTPException(502, str(exc))
+    except LLMInvalidJSONError as exc:
+        raise HTTPException(502, str(exc))
     except AuthenticationError:
         raise HTTPException(502, "Ошибка авторизации LLM")
     except RateLimitError:
         raise HTTPException(503, "LLM перегружена, повторите позже")
     except (APITimeoutError, TimeoutError):
         raise HTTPException(504, "LLM не ответила вовремя")
+    except APIConnectionError:
+        raise HTTPException(
+            502,
+            "Не удалось подключиться к LLM. Проверьте OPENAI_BASE_URL и сеть.",
+        )
+    except APIStatusError as exc:
+        raise HTTPException(502, f"LLM вернула HTTP {exc.status_code}: {exc.message}")
 
     final = await g.aget_state(config)
     return {

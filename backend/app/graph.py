@@ -22,9 +22,15 @@ class LLMEmptyResponseError(RuntimeError):
     """LLM вернула пустой content (reasoning съел весь max_tokens или провайдер вернул '')."""
 
 
-class DraftState(TypedDict):
+class LLMInvalidJSONError(RuntimeError):
+    """LLM вернула невалидный JSON даже после retry с усиленным hint."""
+
+
+class DraftState(TypedDict, total=False):
     raw_input: dict
     missing_fields: list[str]
+    field_profile: list[str]
+    desc_facts: dict[str, str]
     draft: Optional[dict]
     validation_errors: list[str]
     validation_iteration: int
@@ -40,18 +46,77 @@ class CritiqueResult(BaseModel):
     issues: list[str] = Field(default_factory=list, description="Конкретные проблемы")
 
 
-EXPECTED_SPEC_FIELDS = [
-    "диапазон измерений", "класс точности", "присоединение",
-    "выходной сигнал", "питание", "рабочая температура",
-    "степень защиты", "интерфейсы", "материал корпуса",
-    "диаметр корпуса", "габариты", "масса",
+# ─── Профили ожидаемых полей по типу прибора ────────────────────────
+# Ключи — подстроки в name/description (в нижнем регистре). Профиль
+# определяет, для каких полей ставится «данных нет»: например, манометру
+# не нужны «выходной сигнал» и «питание», а датчику давления — нужны.
+CASE_FIELD_PROFILES: dict[str, list[str]] = {
+    "датчик давления": [
+        "диапазон измерений", "класс точности", "выходной сигнал",
+        "питание", "присоединение", "степень защиты", "рабочая температура",
+        "материал корпуса", "интерфейсы",
+    ],
+    "расходомер": [
+        "диапазон измерений", "класс точности", "выходной сигнал",
+        "питание", "присоединение", "степень защиты", "материал корпуса",
+    ],
+    "уровнемер": [
+        "диапазон измерений", "класс точности", "выходной сигнал",
+        "питание", "присоединение", "степень защиты", "рабочая температура",
+    ],
+    "термометр": [
+        "диапазон измерений", "класс точности", "присоединение",
+        "длина монтажной части", "степень защиты", "материал корпуса",
+    ],
+    "термопара": [
+        "тип", "диапазон измерений", "класс точности",
+        "диаметр гильзы", "длина монтажной части", "степень защиты",
+    ],
+    "манометр": [
+        "диапазон измерений", "класс точности", "присоединение",
+        "диаметр корпуса", "рабочая температура", "степень защиты",
+        "материал корпуса",
+    ],
+    "датчик": [
+        "диапазон измерений", "класс точности", "выходной сигнал",
+        "питание", "присоединение", "степень защиты", "рабочая температура",
+        "материал корпуса", "интерфейсы",
+    ],
+}
+
+DEFAULT_FIELD_PROFILE: list[str] = [
+    "диапазон измерений", "класс точности", "присоединение", "степень защиты",
 ]
+
+# Факты, которые можно выудить из свободного description и подставить
+# вместо «данных нет». Список осознанно узкий — только однозначные паттерны.
+DESCRIPTION_FACT_PATTERNS: dict[str, list[tuple[str, str]]] = {
+    "материал корпуса": [
+        (r"корпус\w*\s+из\s+нержавеющ\w*\s+стал\w*", "нержавеющая сталь"),
+        (r"нержавеющ\w*\s+стал\w*", "нержавеющая сталь"),
+        (r"корпус\w*\s+из\s+латун\w*", "латунь"),
+        (r"корпус\w*\s+из\s+алюмини\w*", "алюминий"),
+        (r"корпус\w*\s+из\s+пластик\w*", "пластик"),
+        (r"корпус\w*\s+из\s+стал\w*", "сталь"),
+    ],
+    "интерфейсы": [
+        (r"\bHART\b", "HART"),
+        (r"\bRS-?485\b", "RS-485"),
+        (r"\bRS-?232\b", "RS-232"),
+        (r"\bModbus\b", "Modbus"),
+        (r"\bProfibus\b", "Profibus"),
+    ],
+    "выходной сигнал": [
+        (r"токов\w*\s+сигнал\w*\s+4[–\-]20\s*мА", "4–20 мА"),
+        (r"сигнал\w*\s+4[–\-]20\s*мА", "4–20 мА"),
+    ],
+}
 
 MAX_VALIDATION_RETRIES = 1
 MIN_SEO_LEN_DEFAULT = 800
 MIN_SEO_LEN_SPARSE = 400
 MAX_SEO_LEN = 1200
-SPARSE_THRESHOLD = 8
+SPARSE_MIN_MISSING = 3
 
 LLM_CALL_TIMEOUT_SECONDS = (
     settings.llm_timeout_seconds * (settings.llm_max_retries + 1) + 30
@@ -62,6 +127,30 @@ def _extract_numbers(text: str) -> set[str]:
     s = str(text).replace(",", ".")
     nums = re.findall(r"\d+(?:\.\d+)?", s)
     return {n for n in nums if len(n.replace(".", "")) >= 2}
+
+
+def _detect_field_profile(raw_input: dict) -> list[str]:
+    text = " ".join([
+        str(raw_input.get("name", "")),
+        str(raw_input.get("description", "")),
+    ]).lower()
+    # Длинные ключи первыми, чтобы «датчик давления» выигрывал у «датчик».
+    for key in sorted(CASE_FIELD_PROFILES.keys(), key=len, reverse=True):
+        if key in text:
+            return CASE_FIELD_PROFILES[key]
+    return DEFAULT_FIELD_PROFILE
+
+
+def _extract_facts_from_description(description: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    if not description:
+        return found
+    for field, patterns in DESCRIPTION_FACT_PATTERNS.items():
+        for pattern, value in patterns:
+            if re.search(pattern, description, re.IGNORECASE):
+                found[field] = value
+                break
+    return found
 
 
 _openai_client: Optional[AsyncOpenAI] = None
@@ -165,15 +254,9 @@ def _extract_json(text: str) -> dict:
 async def _invoke_structured(prompt: str, schema_cls):
     """Запрос к LLM + парсинг JSON в Pydantic-модель с одним retry.
 
-    Первый вызов — исходный prompt как есть (в промптах уже сказано
-    «Отвечай только JSON», так что hint не нужен). Если парсинг упал —
-    второй вызов с усиленным hint'ом: перечисляем ожидаемые ключи,
-    запрещаем markdown-обёртку и trailing comma.
-
-    Один retry закрывает подавляющее большинство «сломанных» ответов
-    (модель добавила ```json обёртку, оборвала строку, оставила
-    trailing comma). Второй вызов дешевле, чем показать пользователю
-    generic «Внутренняя ошибка сервера».
+    Если и после retry парсинг/валидация падают — поднимаем
+    LLMInvalidJSONError с понятным сообщением (обрабатывается в api.py
+    и cli.py как 502/сообщение пользователю).
     """
     fields = ", ".join(schema_cls.model_fields.keys())
 
@@ -207,21 +290,33 @@ async def _invoke_structured(prompt: str, schema_cls):
             exc,
             content[:800],
         )
-        raise
+        raise LLMInvalidJSONError(
+            f"LLM вернула некорректный JSON после повторного запроса "
+            f"({type(exc).__name__}: {exc}). Проверьте MODEL_NAME и "
+            f"USE_JSON_MODE в backend/.env."
+        ) from exc
 
 
 def prepare_input(state: DraftState) -> dict:
     raw = state["raw_input"]
     specs = raw.get("specs") or {}
-    present = {k.lower().strip() for k in specs}
+    present = {k.lower().strip() for k in specs if isinstance(k, str)}
 
-    missing = [f for f in EXPECTED_SPEC_FIELDS if f not in present]
+    desc_facts = _extract_facts_from_description(raw.get("description") or "")
+    present |= {k.lower() for k in desc_facts}
+
+    profile = _detect_field_profile(raw)
+    missing = [f for f in profile if f.lower() not in present]
     if not raw.get("description") or len(raw["description"].strip()) < 30:
         missing.append("описание из паспорта")
     if not specs:
         missing.append("все характеристики")
 
-    return {"missing_fields": missing}
+    return {
+        "missing_fields": missing,
+        "field_profile": profile,
+        "desc_facts": desc_facts,
+    }
 
 
 async def generate_draft(state: DraftState) -> dict:
@@ -249,14 +344,18 @@ async def generate_draft(state: DraftState) -> dict:
     result: LLMCard = await _invoke_structured(prompt, LLMCard)
     draft = result.model_dump()
 
+    # specifications = точные specs пользователя + факты из description
+    # + «данных нет» только для полей, релевантных данному типу прибора.
     specs_out: dict[str, str] = {}
     for k, v in (raw.get("specs") or {}).items():
         key = k.lower().strip() if isinstance(k, str) else str(k)
         specs_out[key] = v
 
-    for field in EXPECTED_SPEC_FIELDS:
-        if field not in specs_out:
-            specs_out[field] = "данных нет"
+    for k, v in (state.get("desc_facts") or {}).items():
+        specs_out.setdefault(k, v)
+
+    for field in state.get("field_profile") or []:
+        specs_out.setdefault(field, "данных нет")
 
     draft["specifications"] = specs_out
 
@@ -273,6 +372,7 @@ def validate_draft(state: DraftState) -> dict:
     draft = state.get("draft") or {}
     raw = state["raw_input"]
     missing = state.get("missing_fields", [])
+    profile = state.get("field_profile") or []
 
     title = draft.get("title") or ""
     if not title:
@@ -294,7 +394,10 @@ def validate_draft(state: DraftState) -> dict:
 
     seo = draft.get("seo_description") or ""
     seo_len = len(seo)
-    min_len = MIN_SEO_LEN_SPARSE if len(missing) >= SPARSE_THRESHOLD else MIN_SEO_LEN_DEFAULT
+    # «Разреженные» данные: пропущено ≥ половины полей профиля и хотя бы 3.
+    sparse_threshold = max(SPARSE_MIN_MISSING, len(profile) // 2)
+    is_sparse = len(missing) >= sparse_threshold
+    min_len = MIN_SEO_LEN_SPARSE if is_sparse else MIN_SEO_LEN_DEFAULT
     if seo_len < min_len or seo_len > MAX_SEO_LEN:
         errors.append(
             f"seo_description: {seo_len} символов, нужно {min_len}–{MAX_SEO_LEN}"
@@ -330,9 +433,14 @@ async def critic(state: DraftState) -> dict:
     if state.get("critic_iteration", 0) >= 1:
         return {"critic_issues": []}
 
+    raw = state["raw_input"]
     result: CritiqueResult = await _invoke_structured(
         CRITIC_PROMPT.format(
-            raw_specs=state["raw_input"].get("specs") or {},
+            name=raw.get("name", ""),
+            manufacturer=raw.get("manufacturer", ""),
+            raw_specs=raw.get("specs") or {},
+            description=raw.get("description") or "",
+            missing_fields=", ".join(state.get("missing_fields", [])) or "нет",
             draft=state["draft"],
         ),
         CritiqueResult,

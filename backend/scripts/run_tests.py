@@ -14,9 +14,17 @@ import asyncio
 import sys
 import traceback
 import uuid
+import warnings
 from pathlib import Path
 
-from pydantic import ValidationError
+# langgraph импортируется ДО app.*, поэтому фильтр нужен здесь, до
+# всех остальных импортов. См. также app/__init__.py (покрывает uvicorn).
+warnings.filterwarnings(
+    "ignore",
+    message="The default value of `allowed_objects` will change",
+)
+
+from pydantic import ValidationError  # noqa: E402
 
 # чтобы `import app.*` работал при запуске из backend/
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -57,7 +65,7 @@ def head(msg: str) -> str:
 # ────────────────────────────────────────────────────────────────
 
 # Категория A: неполные / некорректные входные данные.
-# Каждый кейс — (описание, dict, ожидаемое_поле_ошибки).
+# (описание, dict, ожидаемое_поле_ошибки)
 BAD_INPUT_CASES = [
     (
         "Пустое name",
@@ -70,10 +78,25 @@ BAD_INPUT_CASES = [
         "manufacturer",
     ),
     (
-        "Нестроковое значение в specs",
-        {"name": "Y", "manufacturer": "X", "specs": {"a": 123}, "description": "x" * 40},
+        "specs не является объектом",
+        {"name": "Y", "manufacturer": "X", "specs": "not-a-dict", "description": "x" * 40},
         "specs",
     ),
+    (
+        "Пустой ключ в specs",
+        {"name": "Y", "manufacturer": "X", "specs": {"   ": "v"}, "description": "x" * 40},
+        "specs",
+    ),
+]
+
+# Позитивные кейсы коэрсии: числовые/bool/None значения specs
+# приводятся к строке, а не падают с ValidationError.
+# (описание, raw_specs, ожидаемый_dict)
+SPECS_COERCION_CASES = [
+    ("int → str", {"a": 123}, {"a": "123"}),
+    ("float → str", {"класс точности": 1.5}, {"класс точности": "1.5"}),
+    ("bool → да/нет", {"b": True, "c": False}, {"b": "да", "c": "нет"}),
+    ("None → пусто", {"n": None}, {"n": ""}),
 ]
 
 # Категория B: полноценные входы, граф должен дойти до human_review.
@@ -162,7 +185,7 @@ ITERATION_CASES = [
             {"approved": False, "feedback": "Добавь упоминание взрывозащиты, если применимо"},
             {"approved": True, "feedback": None},
         ],
-        True,   # ожидаем human_approved == True в финале
+        True,
     ),
     (
         "2 отказа → 2 перегенерации → одобрение",
@@ -180,7 +203,7 @@ ITERATION_CASES = [
             {"approved": False, "feedback": "Перепиши в другом стиле"},
             {"approved": False, "feedback": "Перепиши в другом стиле"},
         ],
-        False,  # лимит исчерпан, human_approved остаётся False
+        False,
     ),
     (
         "Отказ без feedback → перегенерация всё равно происходит",
@@ -198,9 +221,13 @@ ITERATION_CASES = [
 # ────────────────────────────────────────────────────────────────
 
 def run_category_a() -> tuple[int, int]:
-    """A. Валидация входа: ProductInput должен бросить ValidationError."""
+    """A. Валидация входа: ProductInput должен либо бросить ValidationError
+    (некорректный тип specs/пустые строки), либо привести числа к строке."""
     head("\n[A] Валидация входных данных")
+
     passed = total = 0
+
+    # Негативные кейсы: ожидаем ValidationError по конкретному полю.
     for desc, payload, expected_field in BAD_INPUT_CASES:
         total += 1
         try:
@@ -219,6 +246,28 @@ def run_category_a() -> tuple[int, int]:
             print("  " + fail(f"{desc} → неожиданное исключение: {e}"))
         else:
             print("  " + fail(f"{desc} → ProductInput принял некорректные данные"))
+
+    # Позитивные кейсы: коэрсия значений specs в строку.
+    for desc, raw_specs, expected in SPECS_COERCION_CASES:
+        total += 1
+        try:
+            card = ProductInput(
+                name="Y",
+                manufacturer="X",
+                specs=raw_specs,
+                description="x" * 40,
+            )
+        except Exception as e:  # noqa: BLE001
+            print("  " + fail(f"{desc} → неожиданное исключение: {e}"))
+            continue
+        if card.specs == expected:
+            passed += 1
+            print("  " + ok(f"{desc} → specs приведены корректно"))
+        else:
+            print("  " + fail(
+                f"{desc} → specs={card.specs!r}, ожидалось {expected!r}"
+            ))
+
     return passed, total
 
 
@@ -229,7 +278,7 @@ def _assert_draft_quality(state_values: dict) -> list[str]:
     if not draft.get("title") or len(draft["title"]) > 70:
         problems.append("title пуст или > 70")
     seo_len = len(draft.get("seo_description") or "")
-    min_len = 400 if len(state_values.get("missing_fields") or []) >= 8 else 800
+    min_len = 400 if len(state_values.get("missing_fields") or []) >= 3 else 800
     if not min_len <= seo_len <= 1200:
         problems.append(f"seo_description {seo_len}, нужно {min_len}–1200")
     if not 3 <= len(draft.get("key_features") or []) <= 5:
@@ -269,7 +318,6 @@ async def run_category_b() -> tuple[int, int]:
                 print("  " + fail(f"{name} → {'; '.join(problems)}"))
                 continue
 
-            # завершаем граф, чтобы не держать состояние
             await graph.ainvoke(
                 Command(resume={"approved": True, "edited_draft": None, "feedback": None}),
                 config=config,
@@ -286,21 +334,19 @@ async def run_category_c() -> tuple[int, int]:
     """C. Итерации: серия решений через resume, проверка перегенерации и лимита."""
     head("\n[C] Human-in-the-loop с итерациями")
     passed = total = 0
-    base_case = GOOD_CASES[0]  # используем манометр DM 02
+    base_case = GOOD_CASES[0]
 
     for desc, decisions, expect_approved in ITERATION_CASES:
         total += 1
         thread_id = f"test-c-{uuid.uuid4()}"
         config = {"configurable": {"thread_id": thread_id}}
         try:
-            # старт графа
             await graph.ainvoke({"raw_input": base_case}, config=config)
             snap = await graph.aget_state(config)
             if "human_review" not in snap.next:
                 print("  " + fail(f"{desc} → граф не остановился на human_review"))
                 continue
 
-            # последовательность решений
             regenerated_count = 0
             for decision in decisions:
                 await graph.ainvoke(
@@ -314,7 +360,6 @@ async def run_category_c() -> tuple[int, int]:
                 snap = await graph.aget_state(config)
 
                 if decision["approved"]:
-                    # после approve граф должен уйти в END
                     if snap.next:
                         print("  " + fail(
                             f"{desc} → после approve граф не завершён, next={snap.next}"
@@ -324,7 +369,6 @@ async def run_category_c() -> tuple[int, int]:
                     if "human_review" in snap.next:
                         regenerated_count += 1
                     elif not snap.next:
-                        # достигнут лимит итераций — это ок для кейса 3
                         pass
                     else:
                         print("  " + fail(
@@ -338,7 +382,6 @@ async def run_category_c() -> tuple[int, int]:
                         f"{desc} → human_approved={final_approved}, ожидалось {expect_approved}"
                     ))
                     continue
-                extra = ""
                 if expect_approved and regenerated_count == 0:
                     print("  " + fail(f"{desc} → перегенерация не произошла"))
                     continue

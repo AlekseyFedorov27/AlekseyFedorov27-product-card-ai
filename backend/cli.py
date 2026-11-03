@@ -6,15 +6,22 @@ import asyncio
 import json
 import sys
 import uuid
+import warnings
 from pathlib import Path
 
-from langgraph.types import Command
-from openai import APITimeoutError, AuthenticationError, RateLimitError
-from pydantic import ValidationError
+# langgraph импортируется до app.* — фильтр должен стоять здесь.
+warnings.filterwarnings(
+    "ignore",
+    message="The default value of `allowed_objects` will change",
+)
 
-from app.api import card_to_markdown
-from app.graph import graph
-from app.schemas import ProductCard, ProductInput
+from langgraph.types import Command  # noqa: E402
+from openai import APITimeoutError, AuthenticationError, RateLimitError  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+from app.api import card_to_markdown  # noqa: E402
+from app.graph import LLMInvalidJSONError, graph  # noqa: E402
+from app.schemas import ProductCard, ProductInput  # noqa: E402
 
 
 async def _run(args) -> int:
@@ -81,6 +88,9 @@ def main() -> int:
     except ValidationError as e:
         print(f"❌ Некорректные входные данные:\n{e}", file=sys.stderr)
         return 2
+    except LLMInvalidJSONError as e:
+        print(f"❌ LLM вернула невалидный JSON: {e}", file=sys.stderr)
+        return 3
     except AuthenticationError:
         print("❌ Неверный API-ключ LLM", file=sys.stderr)
         return 3
