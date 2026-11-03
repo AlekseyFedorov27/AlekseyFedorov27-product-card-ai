@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Состояние LangGraph
+checkpoints.sqlite
+checkpoints.sqlite-*
+*.db
+*.db-*
+
+# Node
+node_modules/
+frontend/.vite/
+
+# Прочее
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
